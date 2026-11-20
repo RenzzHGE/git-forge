@@ -858,7 +858,14 @@ function handleLsRefsV2(res: ServerResponse, repo: Repo, args: string[]): void {
       lines.push(`${headOid} HEAD symref-target:${headName}`);
     }
   } else if (wantUnborn && matches(headName)) {
-    lines.push(`unborn ${headName} symref-target:${headName}`);
+    // Real git's unborn form (`unborn HEAD ...`), NOT `unborn refs/heads/main`:
+    // the suite's ls-refs parser turns the token after `unborn` into the ref
+    // name, so `unborn refs/heads/main` parses as a real ref named
+    // refs/heads/main with the zero oid — clone-empty then counts it as an
+    // existing ref, and the GraphQL fixture mistakes it for an existing
+    // branch tip and fails reading its (nonexistent) tree. With `HEAD` as
+    // the name the line is a symref hint only, and both checks pass.
+    lines.push(`unborn HEAD symref-target:${headName}`);
   }
   const parts = lines.map((line) => pktText(line));
   parts.push(PKT_FLUSH);
