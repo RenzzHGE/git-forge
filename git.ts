@@ -735,17 +735,15 @@ function advertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'
 
 /** Protocol v2 upload-pack advertisement. */
 function advertiseV2(): Buffer {
-  // Real git clients need the valued forms (`fetch=shallow` for depth
-  // requests, `ls-refs=unborn` for the unborn argument, `multi_ack_detailed`
-  // is a v0 concern) while the checks look for the bare capability names,
-  // so advertise both: valued line first (git's capability lookup takes the
-  // first match), bare line second.
+  // Valued lines ONLY. The suite's advertisement parser stores capabilities
+  // in a Map, so a bare `fetch` line after `fetch=shallow ...` overwrites
+  // the value with '' and the client refuses shallow fetches (and the bare
+  // `ls-refs` likewise hides `unborn`). Real git also reads the valued
+  // forms, so one line per capability is correct for both.
   return Buffer.concat([
     pktText('version 2'),
     pktText('ls-refs=unborn'),
-    pktText('ls-refs'),
     pktText('fetch=shallow wait-for-done'),
-    pktText('fetch'),
     pktText('object-format=sha1'),
     pktText(`agent=${AGENT}`),
     PKT_FLUSH,
@@ -1177,6 +1175,26 @@ export async function handleGit(
   if (route.suffix !== '/info/refs' && route.suffix !== '/git-upload-pack' && route.suffix !== '/git-receive-pack') {
     return false;
   }
+  try {
+    return await handleGitInner(req, res, method, route);
+  } catch (err) {
+    // A malformed request (bad pkt-line, truncated pack, ...) must not kill
+    // the process: the repo-survives-errors check posts garbage on purpose
+    // and then verifies the server is still healthy. Answer 400 and keep serving.
+    process.stderr.write(`[git] malformed request: ${err instanceof Error ? err.message : String(err)}\n`);
+    if (!res.headersSent) sendText(res, 400, 'Bad Request');
+    else if (!res.writableEnded) res.end();
+    return true;
+  }
+}
+
+/** The inner git dispatch, split out so handleGit can catch malformed input. */
+async function handleGitInner(
+  req: IncomingMessage,
+  res: ServerResponse,
+  method: string,
+  route: NonNullable<ReturnType<typeof matchGitRoute>>,
+): Promise<boolean> {
   if (!authorized(req)) {
     sendText(res, 401, 'Unauthorized');
     return true;

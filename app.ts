@@ -74,10 +74,23 @@ export function createApp(): Server {
     if (owner !== null) store.setViewerLogin(owner);
     const ctx = { viewerLogin: store.viewerLogin };
 
-    if (await handleMcp(req, res, path, method, ctx)) return;
-    if (await handleGraphql(req, res, path, method, ctx)) return;
-    if (await handleRest(req, res, path, method, ctx)) return;
-    if (await handleGit(req, res, path, method, ctx)) return;
+    // A handler must never kill the process: an uncaught throw (malformed
+    // input, a bug in one surface) would abort the whole trial and zero
+    // every check after it. Answer 500 and keep serving.
+    try {
+      if (await handleMcp(req, res, path, method, ctx)) return;
+      if (await handleGraphql(req, res, path, method, ctx)) return;
+      if (await handleRest(req, res, path, method, ctx)) return;
+      if (await handleGit(req, res, path, method, ctx)) return;
+    } catch (err) {
+      process.stderr.write(`[app] handler error: ${err instanceof Error ? err.message : String(err)}\n`);
+      if (!res.headersSent) {
+        sendJson(res, 500, { message: 'Internal Server Error' });
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+      return;
+    }
 
     // Everything else, every method: GitHub's 404 body.
     sendJson(res, 404, { message: 'Not Found' });
