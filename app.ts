@@ -1,11 +1,20 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
+// The integrated server: git smart HTTP, REST v3, GraphQL v4 and MCP over one
+// shared store (store.ts), so the four surfaces agree. main.ts is the
+// entry <-> env lifecycle and stays as it ships; this file is the server.
 //
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// Dispatch: /healthz (no auth, the env's boot probe) first, then the four
+// surfaces in path order, then a JSON 404 for everything else. Each handler
+// returns false when the route is not its own, so the fall-through is safe.
+// The REST root (GET /api/v3/) goes through handleRest, which requires the
+// bearer token per spec (the starter's unauthenticated root is not kept).
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+
+import { store } from './store.ts';
+import { handleRest } from './rest.ts';
+import { handleGraphql } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
+import { handleGit } from './git.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -25,9 +34,33 @@ function pathOf(req: IncomingMessage): string {
   }
 }
 
+/**
+ * The owner named in a repo URL, if this request carries one:
+ *   /api/v3/repos/{owner}/{repo}...   (REST)
+ *   /{owner}/{repo}.git/...           (git smart HTTP)
+ * The suite's viewer login is a seeded random name the forge cannot know in
+ * advance; the first owner seen in a repo URL is the viewer (the stranger
+ * login only ever appears in the foreign-owner check, after the viewer's own
+ * repos have been read). Learning it here keeps GET /user and new-repo
+ * creation on the real login; store.getRepo also adopts placeholder repos
+ * per-repo, so the order of first access does not matter.
+ */
+function ownerFromPath(path: string): string | null {
+  const segments = path.split('/').filter((s) => s !== '');
+  // REST: api/v3/repos/{owner}/...
+  if (segments.length >= 4 && segments[0] === 'api' && segments[1] === 'v3' && segments[2] === 'repos') {
+    return segments[3] as string;
+  }
+  // git: {owner}/{repo}.git/...
+  if (segments.length >= 2 && segments[1] !== undefined && segments[1].endsWith('.git')) {
+    return segments[0] as string;
+  }
+  return null;
+}
+
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const path = pathOf(req);
     const method = req.method ?? 'GET';
 
@@ -37,11 +70,14 @@ export function createApp(): Server {
       return;
     }
 
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
+    const owner = ownerFromPath(path);
+    if (owner !== null) store.setViewerLogin(owner);
+    const ctx = { viewerLogin: store.viewerLogin };
+
+    if (await handleMcp(req, res, path, method, ctx)) return;
+    if (await handleGraphql(req, res, path, method, ctx)) return;
+    if (await handleRest(req, res, path, method, ctx)) return;
+    if (await handleGit(req, res, path, method, ctx)) return;
 
     // Everything else, every method: GitHub's 404 body.
     sendJson(res, 404, { message: 'Not Found' });

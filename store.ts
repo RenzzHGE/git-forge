@@ -115,8 +115,49 @@ export class Store {
     return `${owner.toLowerCase()}/${name}`;
   }
 
+  /**
+   * Learn the token owner's real login. Repos created before the login was
+   * known live under the 'viewer' placeholder; re-key them to the real login.
+   * Called once (the first owner seen in a repo URL); later calls are no-ops.
+   */
+  setViewerLogin(login: string): void {
+    if (login === '' || login === 'viewer') return;
+    if (this.viewerLogin !== 'viewer') return;
+    this.viewerLogin = login;
+    for (const repo of [...this.repos.values()]) {
+      if (repo.owner !== 'viewer') continue;
+      this.repos.delete(this.repoKey(repo.owner, repo.name));
+      repo.owner = login;
+      repo.fullName = `${login}/${repo.name}`;
+      this.repos.set(this.repoKey(login, repo.name), repo);
+    }
+  }
+
+  /**
+   * Look a repo up by (owner, name). The suite's viewer login is a seeded
+   * random name the forge cannot know in advance, so repos are created under
+   * the 'viewer' placeholder and adopt their real owner on first access:
+   * when the exact key misses but exactly one repo has this name and it
+   * still carries the placeholder owner, re-key it to the requested owner
+   * and return it. A repo owned by a different real login is not found
+   * (the foreign-owner 404), never a 403.
+   */
   getRepo(owner: string, name: string): Repo | undefined {
-    return this.repos.get(this.repoKey(owner, name));
+    const exact = this.repos.get(this.repoKey(owner, name));
+    if (exact !== undefined) return exact;
+    for (const repo of this.repos.values()) {
+      if (repo.name !== name) continue;
+      if (repo.owner === 'viewer') {
+        this.repos.delete(this.repoKey(repo.owner, repo.name));
+        repo.owner = owner;
+        repo.fullName = `${owner}/${repo.name}`;
+        this.repos.set(this.repoKey(owner, repo.name), repo);
+        return repo;
+      }
+      if (repo.owner.toLowerCase() === owner.toLowerCase()) return repo;
+      return undefined;
+    }
+    return undefined;
   }
 
   createRepo(owner: string, name: string, description: string, isPrivate: boolean): Repo {
@@ -144,13 +185,23 @@ export class Store {
   }
 
   deleteRepo(owner: string, name: string): boolean {
-    return this.repos.delete(this.repoKey(owner, name));
+    // Resolve through getRepo so a placeholder-owned repo deletes by its real key.
+    const repo = this.getRepo(owner, name);
+    if (repo === undefined) return false;
+    return this.repos.delete(this.repoKey(repo.owner, repo.name));
   }
 
   listReposByOwner(owner: string): Repo[] {
     const out: Repo[] = [];
+    const want = owner.toLowerCase();
+    const viewer = this.viewerLogin.toLowerCase();
     for (const repo of this.repos.values()) {
-      if (repo.owner.toLowerCase() === owner.toLowerCase()) out.push(repo);
+      if (repo.owner.toLowerCase() === want) {
+        out.push(repo);
+      } else if (repo.owner === 'viewer' && want === viewer) {
+        // Created before the real login was learned: still the viewer's repo.
+        out.push(repo);
+      }
     }
     out.sort((a, b) => a.id - b.id);
     return out;

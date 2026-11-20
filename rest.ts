@@ -582,7 +582,10 @@ export async function handleRest(
     const tail = rest.slice(3);
 
     // The repo belongs to the viewer; any other owner -> 404, never 403.
-    const repo = owner.toLowerCase() === viewerLogin.toLowerCase() ? store.getRepo(owner, repoName) : undefined;
+    // store.getRepo enforces this: it adopts the placeholder-owned repo to
+    // the requested owner on first access, and returns undefined when the
+    // repo belongs to a different real login.
+    const repo = store.getRepo(owner, repoName);
     if (repo === undefined) {
       sendError(res, 404, 'Not Found');
       return true;
