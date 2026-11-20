@@ -182,12 +182,11 @@ func formEncode(s string) string {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-// ownerFromPath returns the owner named in a repo URL, if this request
-// carries one:
+// ownerFromSegments returns the owner named in a repo URL, if this
+// request carries one:
 //   /api/v3/repos/{owner}/{repo}...   (REST)
 //   /{owner}/{repo}.git/...           (git smart HTTP)
-func ownerFromPath(path string) string {
-	segments := splitNonEmpty(path, "/")
+func ownerFromSegments(segments []string) string {
 	// REST: api/v3/repos/{owner}/...
 	if len(segments) >= 4 && segments[0] == "api" && segments[1] == "v3" && segments[2] == "repos" {
 		return segments[3]
@@ -200,7 +199,7 @@ func ownerFromPath(path string) string {
 }
 
 func appSendJSON(w http.ResponseWriter, status int, body *Obj) {
-	text := append(Marshal(body), '\n')
+	text := MarshalNL(body)
 	h := w.Header()
 	h.Set("Content-Type", "application/json; charset=utf-8")
 	h.Set("Content-Length", itoa(len(text)))
@@ -219,8 +218,12 @@ func dispatchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Split the path once: the viewer lookup and the REST handler both
+	// need the segments.
+	segments := splitNonEmpty(path, "/")
+
 	// Learn the viewer login from the first owner seen in a repo URL.
-	if owner := ownerFromPath(path); owner != "" {
+	if owner := ownerFromSegments(segments); owner != "" {
 		storeMu.Lock()
 		store.SetViewerLogin(owner)
 		storeMu.Unlock()
@@ -249,7 +252,7 @@ func dispatchHandler(w http.ResponseWriter, r *http.Request) {
 	if handleGraphql(tw, r, path, method, viewerLogin) {
 		return
 	}
-	if handleRest(tw, r, path, method, viewerLogin) {
+	if handleRest(tw, r, path, method, viewerLogin, segments) {
 		return
 	}
 	if handleGit(tw, r, path, method) {

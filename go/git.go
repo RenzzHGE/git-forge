@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const ZeroOID = "0000000000000000000000000000000000000000"
@@ -181,11 +182,36 @@ func encodeObjectHeader(typeCode, size int) []byte {
 }
 
 func deflate(data []byte) []byte {
+	w := zlibWriterPool.Get().(*zlib.Writer)
 	var buf bytes.Buffer
-	w := zlib.NewWriter(&buf)
+	w.Reset(&buf)
 	_, _ = w.Write(data)
 	_ = w.Close()
+	zlibWriterPool.Put(w)
 	return buf.Bytes()
+}
+
+// zlibWriterPool reuses zlib writers across packs. A fresh zlib.NewWriter
+// allocates ~1MB of flate tables; a fetch that packs 6 objects paid that
+// 6 times per request (and a 50-clone round paid it 300 times).
+var zlibWriterPool = sync.Pool{New: func() any {
+	return zlib.NewWriter(&bytes.Buffer{})
+}}
+
+// deflatedCache memoizes the zlib stream of an object, keyed by its git
+// object id. Objects are immutable, so the stream is a pure function of
+// the id — and a clone round packs the same objects 50 times, so the
+// second and later packs pay nothing for compression. The cached bytes
+// are never mutated after storing (writePack only copies them out).
+var deflatedCache sync.Map // string (object id) -> []byte
+
+func deflateCached(sha string, data []byte) []byte {
+	if v, ok := deflatedCache.Load(sha); ok {
+		return v.([]byte)
+	}
+	b := deflate(data)
+	actual, _ := deflatedCache.LoadOrStore(sha, b)
+	return actual.([]byte)
 }
 
 // writePack writes a packfile version 2 with plain (non-delta) objects,
@@ -215,7 +241,7 @@ func writePack(objects []GitObject) []byte {
 	parts.Write(header)
 	for _, e := range entries {
 		parts.Write(encodeObjectHeader(typeCodes[e.obj.Type], len(e.obj.Content)))
-		parts.Write(deflate(e.obj.Content))
+		parts.Write(deflateCached(e.sha, e.obj.Content))
 	}
 	withoutTrailer := parts.Bytes()
 	trailer := sha1.Sum(withoutTrailer)
@@ -247,23 +273,52 @@ func (r *limitedCountReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// ReadByte makes limitedCountReader a flate.Reader, so zlib.NewReader /
+// Reset use it directly instead of wrapping it in a 4KB bufio.Reader.
+func (r *limitedCountReader) ReadByte() (byte, error) {
+	if len(r.b) == 0 {
+		return 0, io.EOF
+	}
+	c := r.b[0]
+	r.b = r.b[1:]
+	r.n++
+	return c, nil
+}
+
 // inflateOne inflates exactly one zlib stream starting at offset, in a single
 // pass. Go's zlib reader ignores trailing bytes, so the stream end is found
 // from the Adler-32 checksum the reader verified internally: the stream's
 // last 4 bytes equal adler32(data). flate may have pulled up to 63 bytes past
 // the end, so the checksum is scanned in that window. One decompression per
 // object instead of the ~21 of the old binary-search probe.
+//
+// The zlib reader is pooled: a fresh zlib.NewReader allocates the flate
+// dictionary/window (~100KB) per object, and a push unpacks 3 objects.
+var zlibReaderPool = sync.Pool{}
+
+func getZlibReader(r io.Reader) (io.ReadCloser, error) {
+	if v := zlibReaderPool.Get(); v != nil {
+		zr := v.(io.ReadCloser)
+		if err := zr.(zlib.Resetter).Reset(r, nil); err == nil {
+			return zr, nil
+		}
+		// Reset failed: drop the pooled reader and start fresh.
+	}
+	return zlib.NewReader(r)
+}
+
 func inflateOne(buf []byte, offset int) ([]byte, int, error) {
 	if offset >= len(buf) {
 		return nil, 0, errors.New("pack entry truncated: no zlib data")
 	}
 	cr := &limitedCountReader{b: buf[offset:]}
-	zr, err := zlib.NewReader(cr)
+	zr, err := getZlibReader(cr)
 	if err != nil {
 		return nil, 0, err
 	}
 	data, err := io.ReadAll(zr)
 	_ = zr.Close()
+	zlibReaderPool.Put(zr)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -879,18 +934,38 @@ func headerValueGit(r *http.Request, name string) string {
 // non-empty Bearer token is accepted. Missing or wrong token -> 401.
 func gitAuthorized(r *http.Request) bool {
 	header := r.Header.Get("Authorization")
-	m := gitBearerRe.FindStringSubmatch(header)
-	if m == nil {
+	token, ok := gitBearerToken(header)
+	if !ok {
 		return false
 	}
 	expected := shopToken()
 	if expected != "" {
-		return m[1] == expected
+		return token == expected
 	}
-	return strings.TrimSpace(m[1]) != ""
+	return strings.TrimSpace(token) != ""
 }
 
-var gitBearerRe = regexp.MustCompile(`^Bearer\s+(.+)$`)
+// gitBearerToken parses `Authorization: Bearer <token>` without a
+// regexp: `^Bearer\s+(.+)$` — "Bearer", at least one [\t\n\f\r ] (Go
+// regexp \s), then at least one character, taken verbatim to the end.
+func gitBearerToken(header string) (string, bool) {
+	if !strings.HasPrefix(header, "Bearer") {
+		return "", false
+	}
+	rest := header[len("Bearer"):]
+	i := 0
+	for i < len(rest) {
+		c := rest[i]
+		if c != ' ' && c != '\t' && c != '\n' && c != '\f' && c != '\r' {
+			break
+		}
+		i++
+	}
+	if i == 0 || i >= len(rest) {
+		return "", false
+	}
+	return rest[i:], true
+}
 
 type gitRoute struct {
 	owner    string
@@ -898,20 +973,38 @@ type gitRoute struct {
 	suffix   string
 }
 
-var gitRouteRe = regexp.MustCompile(`^/([^/]+)/([^/]+)\.git(/.*)?$`)
-
+// matchGitRoute parses `^/([^/]+)/([^/]+)\.git(/.*)?$` (after stripping
+// the query) without a regexp.
 func matchGitRoute(pathname string) *gitRoute {
-	clean := strings.SplitN(pathname, "?", 2)[0]
-	m := gitRouteRe.FindStringSubmatch(clean)
-	if m == nil {
+	clean := pathname
+	if i := strings.IndexByte(clean, '?'); i >= 0 {
+		clean = clean[:i]
+	}
+	if len(clean) < 2 || clean[0] != '/' {
 		return nil
 	}
-	owner, err1 := urlPathUnescape(m[1])
-	repoName, err2 := urlPathUnescape(m[2])
+	// owner: [^/]+ up to the next '/'.
+	i := strings.IndexByte(clean[1:], '/')
+	if i <= 0 {
+		return nil
+	}
+	owner, err1 := urlPathUnescape(clean[1 : 1+i])
+	rest := clean[1+i+1:]
+	// repo: [^/]+\.git, then an optional suffix starting with '/'.
+	j := strings.IndexByte(rest, '/')
+	var repoPart, suffix string
+	if j < 0 {
+		repoPart, suffix = rest, ""
+	} else {
+		repoPart, suffix = rest[:j], rest[j:]
+	}
+	if len(repoPart) <= 4 || !strings.HasSuffix(repoPart, ".git") {
+		return nil
+	}
+	repoName, err2 := urlPathUnescape(repoPart[:len(repoPart)-4])
 	if err1 != nil || err2 != nil {
 		return nil
 	}
-	suffix := m[3]
 	return &gitRoute{owner: owner, repoName: repoName, suffix: suffix}
 }
 
@@ -1009,15 +1102,24 @@ type fetchSelection struct {
 }
 
 func selectFetchObjects(repo *Repo, wants, haves []string, maxDepth *int, shallowBoundary map[string]bool) fetchSelection {
-	haveReachable := collectReachable(repo.Objects, haves, collectOptions{cutoff: shallowBoundary})
-	exclude := make(map[string]bool, len(haveReachable))
-	for sha := range haveReachable {
-		exclude[sha] = true
+	var exclude map[string]bool
+	if len(haves) > 0 || len(shallowBoundary) > 0 {
+		haveReachable := collectReachable(repo.Objects, haves, collectOptions{cutoff: shallowBoundary})
+		exclude = make(map[string]bool, len(haveReachable))
+		for sha := range haveReachable {
+			exclude[sha] = true
+		}
 	}
 	wanted := collectReachableDetailed(repo.Objects, wants, collectOptions{maxDepth: maxDepth, exclude: exclude, cutoff: shallowBoundary})
 	var shallow, unshallow []string
 	if maxDepth != nil {
-		full := collectReachableDetailed(repo.Objects, wants, collectOptions{maxDepth: maxDepth})
+		// The boundary walk is the same walk as `wanted` when nothing
+		// is excluded and there is no shallow boundary: reuse its
+		// depths instead of walking the history a second time.
+		full := wanted
+		if len(exclude) > 0 || len(shallowBoundary) > 0 {
+			full = collectReachableDetailed(repo.Objects, wants, collectOptions{maxDepth: maxDepth})
+		}
 		boundary := map[string]bool{}
 		for sha, depth := range full.depths {
 			if depth == *maxDepth {

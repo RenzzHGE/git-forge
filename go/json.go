@@ -50,9 +50,14 @@ func (o *Obj) Get(k string) (any, bool) {
 
 func (o *Obj) Len() int { return len(o.keys) }
 
-// O builds an *Obj from alternating key/value pairs.
+// O builds an *Obj from alternating key/value pairs. The key/value
+// slices are pre-sized to the pair count, so building a response object
+// never grows them.
 func O(pairs ...any) *Obj {
-	o := NewObj()
+	o := &Obj{
+		keys: make([]string, 0, len(pairs)/2),
+		vals: make([]any, 0, len(pairs)/2),
+	}
 	for i := 0; i+1 < len(pairs); i += 2 {
 		if k, ok := pairs[i].(string); ok {
 			o.Set(k, pairs[i+1])
@@ -64,9 +69,18 @@ func O(pairs ...any) *Obj {
 // Marshal renders v as JSON, Node-style. Supported: nil, bool, string,
 // int, int64, float64, []any, *Obj, map[string]any (keys sorted, like Go).
 func Marshal(v any) []byte {
-	var b []byte
+	b := make([]byte, 0, 512)
+	return appendJSON(b, v)
+}
+
+// MarshalNL renders v as JSON followed by '\n' (every JSON response body
+// this server sends ends with a newline). The buffer starts with spare
+// capacity so the newline never forces a reallocation for typical
+// single-object responses.
+func MarshalNL(v any) []byte {
+	b := make([]byte, 0, 512)
 	b = appendJSON(b, v)
-	return b
+	return append(b, '\n')
 }
 
 func appendJSON(dst []byte, v any) []byte {

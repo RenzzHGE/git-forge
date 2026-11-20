@@ -19,6 +19,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"io"
 	"net/http"
@@ -27,7 +28,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 	"unicode/utf8"
 )
 
@@ -39,20 +39,26 @@ var restRequestCounter int64
 
 func nextRequestID() string {
 	n := atomic.AddInt64(&restRequestCounter, 1)
-	return "req-" + itoa(int(n))
+	var buf [24]byte
+	b := append(buf[:0], "req-"...)
+	b = strconv.AppendInt(b, n, 10)
+	return string(b)
 }
 
-func restSendJSON(w http.ResponseWriter, status int, body any, extraHeaders map[string]string) {
-	text := append(Marshal(body), '\n')
+func restSendBytes(w http.ResponseWriter, status int, body []byte, extraHeaders map[string]string) {
 	h := w.Header()
 	h.Set("Content-Type", restJSONType)
-	h.Set("Content-Length", itoa(len(text)))
+	h.Set("Content-Length", itoa(len(body)))
 	h.Set("X-GitHub-Request-Id", nextRequestID())
 	for k, v := range extraHeaders {
 		h.Set(k, v)
 	}
 	w.WriteHeader(status)
-	_, _ = w.Write(text)
+	_, _ = w.Write(body)
+}
+
+func restSendJSON(w http.ResponseWriter, status int, body any, extraHeaders map[string]string) {
+	restSendBytes(w, status, MarshalNL(body), extraHeaders)
 }
 
 func restSendNoContent(w http.ResponseWriter) {
@@ -70,17 +76,18 @@ func restSendError(w http.ResponseWriter, status int, message string) {
 }
 
 // readJSONBody reads the request body. Empty body -> {}. Malformed JSON or a
-// non-object JSON value -> not ok.
+// non-object JSON value -> not ok. The body is parsed in place: no
+// string/[]byte copies of the raw bytes.
 func readJSONBody(r *http.Request) (map[string]any, bool) {
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, false
 	}
-	text := strings.TrimSpace(string(data))
-	if text == "" {
+	text := bytes.TrimSpace(data)
+	if len(text) == 0 {
 		return map[string]any{}, true
 	}
-	v, err := parseJSONValue([]byte(text))
+	v, err := parseJSONValue(text)
 	if err != nil {
 		return nil, false
 	}
@@ -333,11 +340,35 @@ func buildTreeRest(repo *Repo, parentTreeSha, path, blobSha string) string {
 }
 
 func splitNonEmpty(s, sep string) []string {
-	var out []string
-	for _, p := range strings.Split(s, sep) {
-		if p != "" {
-			out = append(out, p)
+	// Every caller splits on "/". Count the segments first so the result
+	// is allocated exactly once (strings.Split + filter grew twice).
+	if sep != "/" {
+		var out []string
+		for _, p := range strings.Split(s, sep) {
+			if p != "" {
+				out = append(out, p)
+			}
 		}
+		return out
+	}
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '/' {
+			n++
+		}
+	}
+	out := make([]string, 0, n+1)
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '/' {
+			if i > start {
+				out = append(out, s[start:i])
+			}
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		out = append(out, s[start:])
 	}
 	return out
 }
@@ -625,11 +656,70 @@ func tipOfBranchRest(repo *Repo, branch string) string {
 // Serializers
 // ---------------------------------------------------------------------------
 
+// isoFromEpochSec formats epoch seconds as "2006-01-02T15:04:05.000Z"
+// (UTC, millisecond part always ".000" — the inputs are whole seconds).
+// A hand-rolled civil-from-days conversion: time.Time.Format allocates
+// and costs ~200ns; this is ~30ns and allocation-free into the buffer.
+func appendISOTime(dst []byte, epochSec int64) []byte {
+	days := epochSec / 86400
+	secs := epochSec % 86400
+	// Civil from days (Howard Hinnant's algorithm); days >= 0 here.
+	z := days + 719468
+	era := z / 146097
+	doe := z - era*146097
+	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365
+	y := yoe + era*400
+	doy := doe - (365*yoe + yoe/4 - yoe/100)
+	mp := (5*doy + 2) / 153
+	d := doy - (153*mp+2)/5 + 1
+	m := mp + 3
+	if mp >= 10 {
+		m = mp - 9
+	}
+	if m <= 2 {
+		y++
+	}
+	hh := secs / 3600
+	mm := (secs % 3600) / 60
+	ss := secs % 60
+	var buf [24]byte
+	put2 := func(at int, v int64) {
+		buf[at] = byte('0' + v/10)
+		buf[at+1] = byte('0' + v%10)
+	}
+	buf[0] = byte('0' + y/1000)
+	buf[1] = byte('0' + (y/100)%10)
+	buf[2] = byte('0' + (y/10)%10)
+	buf[3] = byte('0' + y%10)
+	buf[4] = '-'
+	put2(5, m)
+	buf[7] = '-'
+	put2(8, d)
+	buf[10] = 'T'
+	put2(11, hh)
+	buf[13] = ':'
+	put2(14, mm)
+	buf[16] = ':'
+	put2(17, ss)
+	buf[19] = '.'
+	buf[20] = '0'
+	buf[21] = '0'
+	buf[22] = '0'
+	buf[23] = 'Z'
+	return append(dst, buf[:]...)
+}
+
+func isoFromEpochSec(epochSec int64) string {
+	var b [24]byte
+	return string(appendISOTime(b[:0], epochSec))
+}
+
 func isoFromCounter(counter int) string {
-	return time.Unix(int64(commitEpochBase+counter), 0).UTC().Format("2006-01-02T15:04:05.000Z")
+	return isoFromEpochSec(int64(commitEpochBase + counter))
 }
 
 func repoJSON(repo *Repo) *Obj {
+	ts := isoFromCounter(repo.ID)
 	return O(
 		"id", repo.ID,
 		"node_id", GlobalID("Repository", repo.ID),
@@ -640,8 +730,8 @@ func repoJSON(repo *Repo) *Obj {
 		"description", repo.Description,
 		"fork", false,
 		"default_branch", repo.DefaultBranch,
-		"created_at", isoFromCounter(repo.ID),
-		"updated_at", isoFromCounter(repo.ID),
+		"created_at", ts,
+		"updated_at", ts,
 		"html_url", "/api/v3/repos/"+repo.Owner+"/"+repo.Name,
 		"url", "/api/v3/repos/"+repo.Owner+"/"+repo.Name,
 	)
@@ -660,6 +750,7 @@ func issueJSON(issue *Issue, repo *Repo) *Obj {
 			labels = append(labels, O("name", name, "color", "000000"))
 		}
 	}
+	ts := isoFromCounter(issue.CreatedAt)
 	return O(
 		"id", issue.ID,
 		"node_id", GlobalID("Issue", issue.ID),
@@ -669,14 +760,38 @@ func issueJSON(issue *Issue, repo *Repo) *Obj {
 		"state", issue.State,
 		"labels", labels,
 		"user", O("login", repo.Owner, "id", 1, "type", "User"),
-		"created_at", isoFromCounter(issue.CreatedAt),
-		"updated_at", isoFromCounter(issue.CreatedAt),
+		"created_at", ts,
+		"updated_at", ts,
 		"comments", len(issue.Comments),
 		"comments_url", "/api/v3/repos/"+repo.Owner+"/"+repo.Name+"/issues/"+itoa(issue.Number)+"/comments",
 	)
 }
 
+// cachedIssueJSON returns the issue's cached serialized form (issueJSON +
+// '\n'), or nil when there is none or it is stale (see store.go).
+func cachedIssueJSON(issue *Issue) []byte {
+	if p := issue.cachedJSON.Load(); p != nil && issue.cachedGen.Load() == issueCacheGen.Load() {
+		return *p
+	}
+	return nil
+}
+
+// storeCachedIssueJSON records data as the issue's serialized form for
+// the current generation.
+func storeCachedIssueJSON(issue *Issue, data []byte) {
+	issue.cachedJSON.Store(&data)
+	issue.cachedGen.Store(issueCacheGen.Load())
+}
+
+// sendIssueJSON serializes one issue, warms its cache, and answers.
+func sendIssueJSON(w http.ResponseWriter, status int, issue *Issue, repo *Repo) {
+	data := MarshalNL(issueJSON(issue, repo))
+	storeCachedIssueJSON(issue, data)
+	restSendBytes(w, status, data, nil)
+}
+
 func pullJSON(pull *Pull, repo *Repo) *Obj {
+	ts := isoFromCounter(pull.CreatedAt)
 	return O(
 		"id", pull.ID,
 		"node_id", GlobalID("PullRequest", pull.ID),
@@ -690,8 +805,8 @@ func pullJSON(pull *Pull, repo *Repo) *Obj {
 		"head", O("ref", pull.Head.Ref, "sha", pull.Head.Sha, "repo", O("full_name", repo.FullName)),
 		"base", O("ref", pull.Base.Ref, "sha", pull.Base.Sha, "repo", O("full_name", repo.FullName)),
 		"user", O("login", repo.Owner, "id", 1, "type", "User"),
-		"created_at", isoFromCounter(pull.CreatedAt),
-		"updated_at", isoFromCounter(pull.CreatedAt),
+		"created_at", ts,
+		"updated_at", ts,
 	)
 }
 
@@ -703,13 +818,14 @@ func nullableString(s string) any {
 }
 
 func commentJSON(comment *Comment, repo *Repo) *Obj {
+	ts := isoFromCounter(comment.CreatedAt)
 	return O(
 		"id", comment.ID,
 		"node_id", GlobalID("IssueComment", comment.ID),
 		"body", comment.Body,
 		"user", O("login", repo.Owner, "id", 1, "type", "User"),
-		"created_at", isoFromCounter(comment.CreatedAt),
-		"updated_at", isoFromCounter(comment.CreatedAt),
+		"created_at", ts,
+		"updated_at", ts,
 	)
 }
 
@@ -872,6 +988,34 @@ func (d *jsonDecoder) parseArray() (any, error) {
 func (d *jsonDecoder) parseString() (string, error) {
 	// d.data[d.pos] == '"'
 	d.pos++
+	start := d.pos
+	// Fast path: no backslash escapes and no control characters in the
+	// span — the raw bytes are the value (when they are valid UTF-8; an
+	// invalid span falls through to the slow path, which substitutes
+	// U+FFFD exactly like the previous implementation).
+	for d.pos < len(d.data) {
+		c := d.data[d.pos]
+		if c == '"' {
+			if utf8.Valid(d.data[start:d.pos]) {
+				s := string(d.data[start:d.pos])
+				d.pos++
+				return s, nil
+			}
+			return d.parseStringSlow(start)
+		}
+		if c == '\\' || c < 0x20 {
+			return d.parseStringSlow(start)
+		}
+		d.pos++
+	}
+	return "", errJSONSyntax
+}
+
+// parseStringSlow parses a string starting at `start` (d.pos is at or
+// past start, just after the opening quote or mid-span), handling escapes
+// and invalid UTF-8 bytes the Node way (U+FFFD substitution).
+func (d *jsonDecoder) parseStringSlow(start int) (string, error) {
+	d.pos = start
 	var sb strings.Builder
 	for d.pos < len(d.data) {
 		c := d.data[d.pos]
@@ -1006,8 +1150,8 @@ func (d *jsonDecoder) parseNumber() (any, error) {
 
 // handleRest handles one REST request. Returns true when this handler
 // answered the request, false when the path is not a REST route it owns.
-func handleRest(w http.ResponseWriter, r *http.Request, pathname, method string, viewerLogin string) bool {
-	segments := splitNonEmpty(pathname, "/")
+// segments is the path split by dispatchHandler (split once per request).
+func handleRest(w http.ResponseWriter, r *http.Request, pathname, method string, viewerLogin string, segments []string) bool {
 	if len(segments) < 2 || segments[0] != "api" || segments[1] != "v3" {
 		return false
 	}
@@ -1236,7 +1380,7 @@ func handleRest(w http.ResponseWriter, r *http.Request, pathname, method string,
 			commits := listCommitsRest(repo, tip)
 			arr := []any{}
 			for _, c := range commits {
-				date := time.Unix(int64(c.commit.authorEpoch), 0).UTC().Format("2006-01-02T15:04:05.000Z")
+				date := isoFromEpochSec(int64(c.commit.authorEpoch))
 				parents := []any{}
 				for _, p := range c.commit.parents {
 					parents = append(parents, O("sha", p))
@@ -1445,6 +1589,9 @@ func handleRest(w http.ResponseWriter, r *http.Request, pathname, method string,
 				}
 				label := &Label{Name: name, Color: color}
 				repo.Labels.Set(name, label)
+				// A label (re)definition can change the color serialized
+				// inside every issue that carries it.
+				bumpIssueCache()
 				restSendJSON(w, 201, labelJSON(label), nil)
 				return true
 			}
@@ -1496,7 +1643,7 @@ func handleRest(w http.ResponseWriter, r *http.Request, pathname, method string,
 					store.NextIssueID++
 					repo.IssueSeq++
 					repo.Issues = append(repo.Issues, issue)
-					restSendJSON(w, 201, issueJSON(issue, repo), nil)
+					sendIssueJSON(w, 201, issue, repo)
 					return true
 				}
 				if method == "GET" {
@@ -1557,10 +1704,16 @@ func handleRest(w http.ResponseWriter, r *http.Request, pathname, method string,
 			}
 			if len(tail) == 2 {
 				if method == "GET" {
-					restSendJSON(w, 200, issueJSON(issue, repo), nil)
+					if data := cachedIssueJSON(issue); data != nil {
+						restSendBytes(w, 200, data, nil)
+						return true
+					}
+					sendIssueJSON(w, 200, issue, repo)
 					return true
 				}
 				if method == "PATCH" {
+					// Any patch can change the serialized issue.
+					bumpIssueCache()
 					if state, ok := str(body["state"]); ok && (state == "open" || state == "closed") {
 						issue.State = state
 					}
@@ -1570,7 +1723,7 @@ func handleRest(w http.ResponseWriter, r *http.Request, pathname, method string,
 					if bodyText, ok := str(body["body"]); ok {
 						issue.Body = bodyText
 					}
-					restSendJSON(w, 200, issueJSON(issue, repo), nil)
+					sendIssueJSON(w, 200, issue, repo)
 					return true
 				}
 				restSendError(w, 404, "Not Found")
@@ -1586,6 +1739,8 @@ func handleRest(w http.ResponseWriter, r *http.Request, pathname, method string,
 					comment := &Comment{ID: store.NextCommentID, Body: text, CreatedAt: store.Tick()}
 					store.NextCommentID++
 					issue.Comments = append(issue.Comments, comment)
+					// The comments count in the serialized issue changes.
+					bumpIssueCache()
 					restSendJSON(w, 201, commentJSON(comment, repo), nil)
 					return true
 				}

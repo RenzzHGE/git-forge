@@ -1266,6 +1266,7 @@ func gqlResolveField(ctx *gqlExecContext, parentType string, parent any, field *
 				return gqlResolved{}, &gqlFieldError{message: fmt.Sprintf("Issue not found for id %q.", jsString(input["issueId"])), path: append(append([]any{}, path...), name)}
 			}
 			issue.State = "closed"
+			bumpIssueCache()
 			return gqlResolved{value: &gqlIssuePayload{issue: issue}, typ: "CloseIssuePayload"}, nil
 		}
 		if name == "createPullRequest" {
@@ -1352,6 +1353,7 @@ func gqlResolveField(ctx *gqlExecContext, parentType string, parent any, field *
 			store.NextCommentID++
 			comment := &Comment{ID: commentID, Body: jsString(input["body"]), CreatedAt: store.Tick()}
 			issue.Comments = append(issue.Comments, comment)
+			bumpIssueCache()
 			return gqlResolved{value: &gqlAddCommentPayload{commentEdge: &gqlCommentEdge{node: &gqlCommentNode{id: GlobalID("Comment", commentID), body: comment.Body}}}, typ: "AddCommentPayload"}, nil
 		}
 		return gqlResolved{}, gqlUnknownField("Mutation", name, path)
@@ -1933,7 +1935,7 @@ func gqlExecuteDocument(entry map[string]any, viewerLogin string) *Obj {
 }
 
 func gqlSendJSON(w http.ResponseWriter, status int, body any) {
-	text := append(Marshal(body), '\n')
+	text := MarshalNL(body)
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
 	h.Set("Content-Length", itoa(len(text)))

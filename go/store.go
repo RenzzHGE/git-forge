@@ -22,7 +22,17 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
+
+// issueCacheGen is bumped whenever a mutation can change the serialized
+// form of an already-existing issue (label create, issue patch, comment
+// add, viewer adoption). A cached issue JSON is valid only while its
+// stored generation still equals this one, so a stale cache can only
+// cause a rebuild, never a stale response.
+var issueCacheGen atomic.Uint64
+
+func bumpIssueCache() { issueCacheGen.Add(1) }
 
 type GitObjectType string
 
@@ -58,6 +68,13 @@ type Issue struct {
 	Labels    []string
 	CreatedAt int
 	Comments  []*Comment
+
+	// cachedJSON holds the last serialized form of this issue (issueJSON +
+	// '\n'), valid while cachedGen equals issueCacheGen. Written only by
+	// the REST issue serializer, read by the GET handler; both are
+	// atomic, so concurrent readers never observe a torn value.
+	cachedJSON atomic.Pointer[[]byte]
+	cachedGen  atomic.Uint64
 }
 
 type PullFile struct {
@@ -236,8 +253,21 @@ func NewStore() *Store {
 	}
 }
 
+// lowerOwner is strings.ToLower with a fast path: when the owner has no
+// ASCII uppercase letter and no non-ASCII byte, lowercasing is the
+// identity, so the original string is returned without allocating.
+func lowerOwner(owner string) string {
+	for i := 0; i < len(owner); i++ {
+		c := owner[i]
+		if (c >= 'A' && c <= 'Z') || c >= 0x80 {
+			return strings.ToLower(owner)
+		}
+	}
+	return owner
+}
+
 func (s *Store) repoKey(owner, name string) string {
-	return strings.ToLower(owner) + "/" + name
+	return lowerOwner(owner) + "/" + name
 }
 
 func (s *Store) SetViewerLogin(login string) {
@@ -247,6 +277,9 @@ func (s *Store) SetViewerLogin(login string) {
 	if s.ViewerLogin != "viewer" {
 		return
 	}
+	// Adopting the viewer renames every "viewer"-owned repo, which changes
+	// the user.login / comments_url in their serialized issues.
+	bumpIssueCache()
 	s.ViewerLogin = login
 	for _, repo := range s.repos {
 		if repo.Owner != "viewer" {
@@ -268,6 +301,9 @@ func (s *Store) GetRepo(owner, name string) *Repo {
 			continue
 		}
 		if repo.Owner == "viewer" {
+			// Adoption renames the repo, which changes the serialized
+			// form of its issues.
+			bumpIssueCache()
 			delete(s.byKey, s.repoKey(repo.Owner, repo.Name))
 			repo.Owner = owner
 			repo.FullName = owner + "/" + repo.Name

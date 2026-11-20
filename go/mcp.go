@@ -730,7 +730,7 @@ var mcpToolHandlers = map[string]func(map[string]any, string) mcpToolOutcome{
 const mcpJSONType = "application/json; charset=utf-8"
 
 func mcpSendJSON(w http.ResponseWriter, status int, body any) {
-	text := append(Marshal(body), '\n')
+	text := MarshalNL(body)
 	if !wroteHeader(w) {
 		h := w.Header()
 		h.Set("Content-Type", mcpJSONType)
