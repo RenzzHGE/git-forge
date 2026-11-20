@@ -19,11 +19,11 @@ import (
 	"hash/adler32"
 	"io"
 	"net/http"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const ZeroOID = "0000000000000000000000000000000000000000"
@@ -53,14 +53,18 @@ type pktPacket struct {
 	data []byte
 }
 
+const pktHexDigits = "0123456789abcdef"
+
 // pktEncode encodes one pkt-line: 4 lowercase-hex length bytes + payload.
+// The length is written by hand: fmt.Sprintf("%04x", ...) allocated on
+// every packet (every line of every git response).
 func pktEncode(payload []byte) []byte {
 	if len(payload)+4 > maxPktSize {
 		panic(fmt.Sprintf("pkt-line payload too large: %d", len(payload)))
 	}
-	header := fmt.Sprintf("%04x", len(payload)+4)
-	out := make([]byte, 0, len(payload)+4)
-	out = append(out, header...)
+	n := len(payload) + 4
+	out := make([]byte, 0, n)
+	out = append(out, pktHexDigits[(n>>12)&0xf], pktHexDigits[(n>>8)&0xf], pktHexDigits[(n>>4)&0xf], pktHexDigits[n&0xf])
 	out = append(out, payload...)
 	return out
 }
@@ -154,6 +158,84 @@ func pktLines(packets []*pktPacket) []string {
 	}
 	return out
 }
+
+// gitRespCache memoizes git responses that are pure functions of their
+// inputs, so the 50 clones of one round pay the fetch once.
+//
+// A fetch pack is content-addressed: for a fixed repo, the objects
+// reachable from fixed wants (minus fixed haves, at a fixed depth)
+// cannot change when new objects arrive — reachability follows immutable
+// content links, and a fetch never reads refs — so the key needs only
+// the repo id plus the request inputs, never a generation counter.
+// (A receive-pack that only adds objects cannot change any fetch's
+// pack; a ref change cannot either.)
+//
+// Advertise / ls-refs depend only on the ref set, so their key carries
+// a fingerprint of the refs (sorted name=oid pairs) instead of a
+// generation: refs are the only input, and the fingerprint is exact.
+//
+// Entries are immutable []byte, never mutated after storing; the cache
+// is capped (old entries simply stop being added, never evicted) so a
+// long conformance run cannot grow it without bound.
+var gitRespCache sync.Map // string -> []byte
+var gitRespCacheCount atomic.Int64
+
+func gitCacheGet(key string) ([]byte, bool) {
+	if v, ok := gitRespCache.Load(key); ok {
+		return v.([]byte), true
+	}
+	return nil, false
+}
+
+func gitCachePut(key string, body []byte) {
+	if gitRespCacheCount.Load() >= 1024 {
+		return
+	}
+	if _, loaded := gitRespCache.LoadOrStore(key, body); !loaded {
+		gitRespCacheCount.Add(1)
+	}
+}
+
+// refsFingerprint is the exact input an advertise / ls-refs response
+// depends on: the repo's ref set (names + tips), sorted.
+func refsFingerprint(repo *Repo) string {
+	names := make([]string, 0, len(repo.Refs))
+	for name := range repo.Refs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, name := range names {
+		b.WriteString(name)
+		b.WriteByte('=')
+		b.WriteString(repo.Refs[name])
+		b.WriteByte(';')
+	}
+	return b.String()
+}
+
+func fetchCacheKey(proto string, repo *Repo, wants, haves []string, maxDepth *int) string {
+	depth := "n"
+	if maxDepth != nil {
+		depth = itoa(*maxDepth)
+	}
+	return proto + "|" + itoa(repo.ID) + "|" + strings.Join(wants, ",") + "|" + strings.Join(haves, ",") + "|" + depth
+}
+
+// advertiseV0Cached serves the v0 advertisement from the cache when the
+// ref set is unchanged.
+func advertiseV0Cached(repo *Repo, service string) []byte {
+	key := "adv0|" + itoa(repo.ID) + "|" + refsFingerprint(repo) + "|" + service
+	if body, ok := gitCacheGet(key); ok {
+		return body
+	}
+	body := advertiseV0(repo, service)
+	gitCachePut(key, body)
+	return body
+}
+
+// listRefs is also called by advertiseV0; the advertisement cache above
+// covers that path, and ls-refs caches its whole response body below.
 
 // ---------------------------------------------------------------------------
 // packfile v2 (plain objects; OFS_DELTA / REF_DELTA resolved when they appear)
@@ -1155,18 +1237,23 @@ func handleInfoRefs(w http.ResponseWriter, r *http.Request, repo *Repo) {
 		if strings.TrimSpace(headerValueGit(r, "git-protocol")) == "version=2" {
 			sendBufferGit(w, 200, "application/x-git-upload-pack-advertisement", advertiseV2())
 		} else {
-			sendBufferGit(w, 200, "application/x-git-upload-pack-advertisement", advertiseV0(repo, "git-upload-pack"))
+			sendBufferGit(w, 200, "application/x-git-upload-pack-advertisement", advertiseV0Cached(repo, "git-upload-pack"))
 		}
 		return
 	}
 	if service == "git-receive-pack" {
-		sendBufferGit(w, 200, "application/x-git-receive-pack-advertisement", advertiseV0(repo, "git-receive-pack"))
+		sendBufferGit(w, 200, "application/x-git-receive-pack-advertisement", advertiseV0Cached(repo, "git-receive-pack"))
 		return
 	}
 	sendTextGit(w, 404, "Not Found")
 }
 
 func handleLsRefsV2(w http.ResponseWriter, repo *Repo, args []string) {
+	lsKey := "lsrefs|" + itoa(repo.ID) + "|" + refsFingerprint(repo) + "|" + strings.Join(args, "\n")
+	if body, ok := gitCacheGet(lsKey); ok {
+		sendBufferGit(w, 200, "application/x-git-upload-pack-result", body)
+		return
+	}
 	wantPeel := false
 	wantSymrefs := false
 	wantUnborn := false
@@ -1227,7 +1314,9 @@ func handleLsRefsV2(w http.ResponseWriter, repo *Repo, args []string) {
 		parts = append(parts, pktText(line))
 	}
 	parts = append(parts, pktFlush)
-	sendBufferGit(w, 200, "application/x-git-upload-pack-result", bytes.Join(parts, nil))
+	body := bytes.Join(parts, nil)
+	gitCachePut(lsKey, body)
+	sendBufferGit(w, 200, "application/x-git-upload-pack-result", body)
 }
 
 func handleFetchV2(w http.ResponseWriter, repo *Repo, args []string) {
@@ -1276,6 +1365,11 @@ func handleFetchV2(w http.ResponseWriter, repo *Repo, args []string) {
 			maxDepth = &v
 		}
 	}
+	fetchKey := fetchCacheKey("fetch2", repo, wants, haves, maxDepth)
+	if body, ok := gitCacheGet(fetchKey); ok {
+		sendBufferGit(w, 200, "application/x-git-upload-pack-result", body)
+		return
+	}
 	selection := selectFetchObjects(repo, wants, haves, maxDepth, setOf(shallowLines))
 	var objs []GitObject
 	for _, obj := range selection.packObjects {
@@ -1302,7 +1396,9 @@ func handleFetchV2(w http.ResponseWriter, repo *Repo, args []string) {
 	parts = append(parts, pktText("packfile"))
 	parts = append(parts, sidebandPackets(pack))
 	parts = append(parts, pktFlush)
-	sendBufferGit(w, 200, "application/x-git-upload-pack-result", bytes.Join(parts, nil))
+	body := bytes.Join(parts, nil)
+	gitCachePut(fetchKey, body)
+	sendBufferGit(w, 200, "application/x-git-upload-pack-result", body)
 }
 
 func setOf(items []string) map[string]bool {
@@ -1420,6 +1516,11 @@ func handleUploadPack(w http.ResponseWriter, r *http.Request, repo *Repo) error 
 		v := *deepen - 1
 		maxDepth = &v
 	}
+	fetchKey := fetchCacheKey("fetch0", repo, wants, haves, maxDepth)
+	if body, ok := gitCacheGet(fetchKey); ok {
+		sendBufferGit(w, 200, "application/x-git-upload-pack-result", body)
+		return nil
+	}
 	selection := selectFetchObjects(repo, wants, haves, maxDepth, nil)
 	var objs []GitObject
 	for _, obj := range selection.packObjects {
@@ -1438,7 +1539,9 @@ func handleUploadPack(w http.ResponseWriter, r *http.Request, repo *Repo) error 
 	parts = append(parts, pktText("NAK"))
 	parts = append(parts, sidebandPackets(pack))
 	parts = append(parts, pktFlush)
-	sendBufferGit(w, 200, "application/x-git-upload-pack-result", bytes.Join(parts, nil))
+	respBody := bytes.Join(parts, nil)
+	gitCachePut(fetchKey, respBody)
+	sendBufferGit(w, 200, "application/x-git-upload-pack-result", respBody)
 	return nil
 }
 
@@ -1458,7 +1561,33 @@ type pushResult struct {
 	reason string
 }
 
-var pushCmdRe = regexp.MustCompile(`^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)$`)
+// parsePushCmd parses `^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)$` without a
+// regexp: the receive-pack command line of every push.
+func parsePushCmd(text string) (pushCommand, bool) {
+	if len(text) < 83 || text[40] != ' ' || text[81] != ' ' {
+		return pushCommand{}, false
+	}
+	isHex40 := func(s string) bool {
+		for i := 0; i < 40; i++ {
+			c := s[i]
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return false
+			}
+		}
+		return true
+	}
+	if !isHex40(text[:40]) || !isHex40(text[41:81]) {
+		return pushCommand{}, false
+	}
+	ref := text[82:]
+	for i := 0; i < len(ref); i++ {
+		c := ref[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r' {
+			return pushCommand{}, false
+		}
+	}
+	return pushCommand{oldOid: text[:40], newOid: text[41:81], ref: ref}, true
+}
 
 func handleReceivePack(w http.ResponseWriter, r *http.Request, repo *Repo) error {
 	body, err := readBodyGit(r)
@@ -1494,8 +1623,8 @@ func handleReceivePack(w http.ResponseWriter, r *http.Request, repo *Repo) error
 				text = text[:nul]
 			}
 		}
-		if m := pushCmdRe.FindStringSubmatch(text); m != nil {
-			commands = append(commands, pushCommand{oldOid: m[1], newOid: m[2], ref: m[3]})
+		if cmd, ok := parsePushCmd(text); ok {
+			commands = append(commands, cmd)
 		}
 	}
 	packBytes := body[reader.offset():]

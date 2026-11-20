@@ -223,16 +223,19 @@ func dispatchHandler(w http.ResponseWriter, r *http.Request) {
 	segments := splitNonEmpty(path, "/")
 
 	// Learn the viewer login from the first owner seen in a repo URL.
+	// Steady state needs no lock at all: once a viewer is adopted the
+	// login never changes again, so only the (single) adopting request
+	// takes the writer lock. Taking a writer lock on every request made
+	// 50 concurrent clones queue behind each other (a writer waits for
+	// every in-flight read lock, and new readers wait for the writer).
 	if owner := ownerFromSegments(segments); owner != "" {
-		storeMu.Lock()
-		store.SetViewerLogin(owner)
-		storeMu.Unlock()
+		if store.ViewerLoginFast() == "viewer" {
+			storeMu.Lock()
+			store.SetViewerLogin(owner)
+			storeMu.Unlock()
+		}
 	}
-	viewerLogin := func() string {
-		storeMu.RLock()
-		defer storeMu.RUnlock()
-		return store.ViewerLogin
-	}()
+	viewerLogin := store.ViewerLoginFast()
 
 	// A handler must never kill the process: an uncaught panic (malformed
 	// input, a bug in one surface) would abort the whole trial and zero

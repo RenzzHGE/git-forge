@@ -239,10 +239,15 @@ type Store struct {
 	NextCommentID int
 	ViewerLogin   string
 	Clock         int
+
+	// viewerLoginV mirrors ViewerLogin for lock-free reads on the hot
+	// path (dispatch): it holds a string and is written only inside
+	// SetViewerLogin, which runs under storeMu.
+	viewerLoginV atomic.Value
 }
 
 func NewStore() *Store {
-	return &Store{
+	s := &Store{
 		byKey:         make(map[string]*Repo),
 		NextRepoID:    1,
 		NextIssueID:   1,
@@ -251,6 +256,17 @@ func NewStore() *Store {
 		ViewerLogin:   "viewer",
 		Clock:         1,
 	}
+	s.viewerLoginV.Store("viewer")
+	return s
+}
+
+// ViewerLoginFast returns the adopted viewer login without taking
+// storeMu (see viewerLoginV).
+func (s *Store) ViewerLoginFast() string {
+	if v := s.viewerLoginV.Load(); v != nil {
+		return v.(string)
+	}
+	return "viewer"
 }
 
 // lowerOwner is strings.ToLower with a fast path: when the owner has no
@@ -281,6 +297,7 @@ func (s *Store) SetViewerLogin(login string) {
 	// the user.login / comments_url in their serialized issues.
 	bumpIssueCache()
 	s.ViewerLogin = login
+	s.viewerLoginV.Store(login)
 	for _, repo := range s.repos {
 		if repo.Owner != "viewer" {
 			continue
